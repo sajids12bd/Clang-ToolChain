@@ -1,0 +1,103 @@
+name: Build Clang.tar.gz
+on:
+  workflow_dispatch:
+    inputs:
+      clang_url:
+        description: Direct URL to Clang tar.gz archive
+        required: false
+        type: string
+        default: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/mirror-goog-main-llvm-toolchain-source/clang-r596125.tar.gz
+      force_release:
+        description: Force release if version already exists
+        required: false
+        type: boolean
+        default: false
+permissions:
+  contents: write
+env:
+  CLANG_URL: ${{ github.event.inputs.clang_url }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y aria2
+      - name: Download Clang
+        run: |
+          VERSION=$(basename "${{ env.CLANG_URL }}" .tar.gz)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "RELEASE_TAG=$VERSION" >> $GITHUB_ENV
+          if git ls-remote --tags origin "refs/tags/$VERSION" | grep -q .; then
+            echo "Release already exists."
+            if [ "${{ github.event.inputs.force_release }}" != "true" ]; then
+              exit 1
+            fi
+          fi
+          mkdir -p downloads
+          aria2c \
+            -x16 \
+            -s16 \
+            -k1M \
+            --continue=true \
+            --auto-file-renaming=false \
+            -d downloads \
+            -o "${VERSION}.tar.gz" \
+            "${{ env.CLANG_URL }}"
+          test -s "downloads/${VERSION}.tar.gz"
+      - name: Verify archive
+        run: |
+          VERSION="${{ env.VERSION }}"
+          mkdir extract
+          tar -xzf "downloads/${VERSION}.tar.gz" -C extract
+          test -x extract/bin/clang
+          CLANG_VERSION_INFO=$(extract/bin/clang --version | head -3)
+          echo "CLANG_VERSION_INFO<<EOF" >> $GITHUB_ENV
+          echo "$CLANG_VERSION_INFO" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          TAR_SIZE=$(du -h "downloads/${VERSION}.tar.gz" | cut -f1)
+          TAR_SHA256=$(sha256sum "downloads/${VERSION}.tar.gz" | cut -d' ' -f1)
+          BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          echo "TAR_SIZE=$TAR_SIZE" >> $GITHUB_ENV
+          echo "TAR_SHA256=$TAR_SHA256" >> $GITHUB_ENV
+          echo "BUILD_DATE=$BUILD_DATE" >> $GITHUB_ENV
+          echo "$CLANG_VERSION_INFO"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.VERSION }}
+          path: downloads/${{ env.VERSION }}.tar.gz
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.VERSION }}
+          files: downloads/${{ env.VERSION }}.tar.gz
+          body: |
+            ## 📦 ${{ env.VERSION }}
+            ### Source
+            `${{ env.CLANG_URL }}`
+            ### File
+            | File | Size | SHA256 |
+            |------|------|--------|
+            | `${{ env.VERSION }}.tar.gz` | ${{ env.TAR_SIZE }} | `${{ env.TAR_SHA256 }}` |
+            ### Clang Version
+            ```
+            ${{ env.CLANG_VERSION_INFO }}
+            ```
+            ### Verify
+            ```bash
+            sha256sum ${{ env.VERSION }}.tar.gz
+            ```
+            ### Extract
+            ```bash
+            tar -xzf ${{ env.VERSION }}.tar.gz
+            export PATH="$(pwd)/bin:$PATH"
+            clang --version
+            ```
+            ---
+            Build Date: ${{ env.BUILD_DATE }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
