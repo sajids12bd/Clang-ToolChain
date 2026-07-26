@@ -1,0 +1,144 @@
+name: "Build Clang"
+
+on:
+  workflow_dispatch:
+    inputs:
+      clang_url:
+        description: "Direct URL to Clang tar.gz archive"
+        required: false
+        type: string
+        default: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/mirror-goog-main-llvm-toolchain-source/clang-r596125.tar.gz"
+      force_release:
+        description: "Force create release even if version exists"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CLANG_URL: ${{ github.event.inputs.clang_url || 'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/mirror-goog-main-llvm-toolchain-source/clang-r584948.tar.gz' }}
+
+jobs:
+  build:
+    name: "🔨 Build Clang"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "📦 Checkout repository"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "🔧 Install dependencies"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y aria2 zip
+
+      - name: "📥 Download"
+        run: |
+          # Derive version slug from URL filename, e.g. "clang-r584948"
+          VERSION=$(basename "${{ env.CLANG_URL }}" .tar.gz)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "RELEASE_TAG=${VERSION}-${{ github.run_number }}" >> $GITHUB_ENV
+
+          # Abort early if this version already has a release (unless forced)
+          if git ls-remote --tags origin "refs/tags/${VERSION}-*" | grep -q .; then
+            EXISTING_TAG=$(git ls-remote --tags origin "refs/tags/${VERSION}-*" | head -1 | sed 's/.*refs\/tags\///')
+            echo "⚠️ Already released as $EXISTING_TAG"
+            if [ "${{ github.event.inputs.force_release }}" != "true" ]; then
+              echo "Set 'Force release' to true to override."
+              exit 1
+            fi
+            echo "✅ Force release enabled, continuing."
+          fi
+
+          mkdir -p downloads
+          echo "🚀 Downloading $VERSION..."
+          for i in {1..3}; do
+            aria2c -x 16 -s 16 --timeout=30 --retry-wait=5 \
+              -o "downloads/${VERSION}.tar.gz" \
+              "${{ env.CLANG_URL }}" && break || sleep 10
+          done
+
+          if [ ! -f "downloads/${VERSION}.tar.gz" ]; then
+            echo "❌ Download failed after 3 attempts"
+            exit 1
+          fi
+          echo "✅ Downloaded $(du -h "downloads/${VERSION}.tar.gz" | cut -f1)"
+
+      - name: "📂 Extract"
+        run: |
+          echo "📂 Extracting ${VERSION}..."
+          mkdir -p "extract/${VERSION}"
+          tar -xzf "downloads/${VERSION}.tar.gz" -C "extract/${VERSION}"
+
+          if [ ! -d "extract/${VERSION}/bin" ]; then
+            echo "❌ Extraction failed — bin/ directory not found"
+            ls -la "extract/${VERSION}/"
+            exit 1
+          fi
+
+          CLANG_VERSION_INFO=$("extract/${VERSION}/bin/clang" --version 2>&1 | head -3)
+          echo "CLANG_VERSION_INFO<<EOF" >> $GITHUB_ENV
+          echo "$CLANG_VERSION_INFO" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+          echo "✅ Extracted OK"
+          echo "$CLANG_VERSION_INFO"
+
+      - name: "🗜️ Compress as zip"
+        run: |
+          mkdir -p artifacts
+          echo "🗜️ Creating ${VERSION}-linux-x86_64.zip..."
+          cd "extract/${VERSION}"
+          zip -r9 "../../artifacts/${VERSION}-linux-x86_64.zip" .
+          cd ../..
+
+          ZIP_SIZE=$(du -h "artifacts/${VERSION}-linux-x86_64.zip" | cut -f1)
+          ZIP_SHA256=$(sha256sum "artifacts/${VERSION}-linux-x86_64.zip" | cut -d' ' -f1)
+          echo "ZIP_SIZE=$ZIP_SIZE" >> $GITHUB_ENV
+          echo "ZIP_SHA256=$ZIP_SHA256" >> $GITHUB_ENV
+          echo "BUILD_DATE=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_ENV
+
+          echo "✅ zip created: $ZIP_SIZE  sha256: $ZIP_SHA256"
+
+      - name: "🏷️ Create release"
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "${{ env.VERSION }} for Linux x86_64"
+          body: |
+            ## 📦 ${{ env.VERSION }} for Linux x86_64
+
+            ### 🔗 Source
+            - **Downloaded from:** `${{ env.CLANG_URL }}`
+
+            ### 📁 File
+            | File | Size | SHA256 |
+            |------|------|--------|
+            | `${{ env.VERSION }}-linux-x86_64.zip` | ${{ env.ZIP_SIZE }} | `${{ env.ZIP_SHA256 }}` |
+
+            ### ⚙️ Clang version
+            ```
+            ${{ env.CLANG_VERSION_INFO }}
+            ```
+
+            ### 📝 Usage
+            ```bash
+            unzip ${{ env.VERSION }}-linux-x86_64.zip -d ${{ env.VERSION }}
+            export PATH="$(pwd)/${{ env.VERSION }}/bin:$PATH"
+            clang --version
+            ```
+
+            ### 🔒 Verification
+            ```bash
+            echo "${{ env.ZIP_SHA256 }}  ${{ env.VERSION }}-linux-x86_64.zip" | sha256sum -c
+            ```
+
+            ---
+            **Build date:** ${{ env.BUILD_DATE }} · [Workflow run #${{ github.run_number }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          files: artifacts/${{ env.VERSION }}-linux-x86_64.zip
+          draft: false
+          prerelease: false
+          
